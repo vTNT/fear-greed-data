@@ -1,0 +1,33 @@
+name: Sync to Gitee
+
+on:
+  schedule:
+    - cron: '45 22 * * *'   # UTC 22:45 = 北京时间 06:45，早于聚宽 08:00 日报
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Sync CSV to Gitee
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        run: python scripts/sync_to_gitee.py
+
+      # 同时把文件提交回 fork，避免 GitHub 因 60 天无活动暂停定时任务
+      - name: Keep fork active
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add fear-greed.csv vix_history.csv
+          git diff --cached --quiet || git commit -m "data: sync ($(date -u +%F))"
+          git push
