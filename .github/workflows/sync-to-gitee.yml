@@ -2,7 +2,7 @@ name: Sync to Gitee
 
 on:
   schedule:
-    - cron: '45 22 * * *'   # UTC 22:45 = 北京时间 06:45，早于聚宽 08:00 日报
+    - cron: '30 23 * * 1-5'   # UTC 23:30 = 北京时间 07:30，仅工作日（美股交易日），早于聚宽 08:00 日报
   workflow_dispatch:
 
 permissions:
