@@ -2,7 +2,10 @@ name: Sync to Gitee
 
 on:
   schedule:
-    - cron: '30 23 * * 1-5'   # UTC 23:30 = 北京时间 07:30，仅工作日（美股交易日），早于聚宽 08:00 日报
+    # 美股收盘后（16:00 ET）立即同步：UTC 21:30 = 北京 05:30（冬令时收盘 21:00 UTC 后 30 分钟）
+    - cron: '30 21 * * 1-5'
+    # 聚宽日报（北京 08:00）前再同步一次，双保险覆盖 Actions 排队延迟
+    - cron: '30 23 * * 1-5'   # UTC 23:30 = 北京时间 07:30
   workflow_dispatch:
 
 permissions:
