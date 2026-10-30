@@ -58,7 +58,12 @@ STOOQ_VIX_URL = 'https://stooq.com/q/d/l/?s=%5Evix&i=d'
 # ============ CNN 恐惧贪婪指数 ============
 def fetch_cnn_fear_greed():
     """从 CNN API 抓取恐惧贪婪指数（2021-02-01 至今）。
-    返回 list[tuple(date_str, score, rating)]，按日期升序。"""
+    返回 list[tuple(date_str, score, rating)]，按日期升序。
+
+    注意：CNN 的 fear_and_greed_historical 里除了每天 00:00 UTC 的日线点，
+    还会追加"当前实时点"（时间戳为抓取时刻或 23:59，数值随盘中行情变动，
+    收盘后次日才被官方用完整数据重算覆盖）。入库只保留日线点，
+    否则会在文件末尾写入盘中半成品，导致与上游仓库的数值对不上。"""
     resp = requests.get(CNN_FG_URL, headers=CNN_HEADERS, timeout=30)
     resp.raise_for_status()
     payload = resp.json()
@@ -68,14 +73,21 @@ def fetch_cnn_fear_greed():
         raise RuntimeError('CNN 响应缺少 fear_and_greed_historical.data')
 
     rows = []
+    dropped = 0
     for entry in data:
         ts_ms = entry['x']
+        t = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        if (t.hour, t.minute, t.second) != (0, 0, 0):
+            dropped += 1          # 实时点，丢弃
+            continue
         score = float(entry['y'])
         rating = entry.get('rating', '')
-        d = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).date()
-        rows.append((d.isoformat(), score, rating))
+        rows.append((t.date().isoformat(), score, rating))
+    if not rows:
+        raise RuntimeError('CNN 日线点为空（全部为实时点？）')
     rows.sort(key=lambda r: r[0])
-    print('  CNN 直抓: %d 行 (%s ~ %s)' % (len(rows), rows[0][0], rows[-1][0]))
+    print('  CNN 直抓: %d 行 (%s ~ %s)，丢弃实时点 %d 个'
+          % (len(rows), rows[0][0], rows[-1][0], dropped))
     return rows
 
 
