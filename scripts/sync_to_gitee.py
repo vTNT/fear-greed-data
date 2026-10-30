@@ -5,7 +5,9 @@
 
 每日直接从数据源拉取最新文件，通过 Gitee OpenAPI 推送至自己的 Gitee 仓库：
   1. fear-greed.csv  —— CNN API 直抓（2021-02-01 至今）+ 本地 pre-2021 静态归档合并
-  2. vix_history.csv —— CBOE 官方 VIX 全量历史
+  2. vix_history.csv —— VIX 收盘价：Yahoo ^VIX（收盘后即时可得）为主，
+                        CBOE 官方全量历史覆盖/兜底，Stooq 第三级，
+                        统一输出 date,close（与聚宽端本地缓存同格式）
 
 不再依赖上游 GitHub 仓库 whit3rabbit/fear-greed-data 的更新时机，
 避免其 Actions 排队延迟导致的数据滞后。
@@ -18,6 +20,7 @@ import csv
 import io
 import os
 import sys
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -44,8 +47,12 @@ CNN_HEADERS = {
 ARCHIVE_PATH = 'datasets/archive/fear-greed-pre-2021.csv'
 ARCHIVE_CUTOFF = '2021-02-01'
 
-# CBOE VIX 全量历史
+# CBOE VIX 全量历史（官方口径，但文件更新时点偏晚，且部分区域被 Cloudflare 拦）
 CBOE_VIX_URL = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'
+# Yahoo ^VIX 日线（美股收盘后几分钟即可拿到当日收盘，适合补 CBOE 的更新延迟）
+YAHOO_VIX_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
+# Stooq VIX 日线 CSV（第三级兜底）
+STOOQ_VIX_URL = 'https://stooq.com/q/d/l/?s=%5Evix&i=d'
 
 
 # ============ CNN 恐惧贪婪指数 ============
@@ -139,6 +146,128 @@ def download(url):
     return content
 
 
+# ============ VIX（多源合并，解决官方文件更新偏晚） ============
+def _norm_date(s):
+    """统一日期格式为 YYYY-MM-DD（兼容 CBOE 的 MM/DD/YYYY 与 ISO 格式）"""
+    s = str(s).strip()
+    for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%Y/%m/%d'):
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError('无法识别的日期: %s' % s)
+
+
+def fetch_cboe_vix():
+    """CBOE 官方 VIX_History.csv → list[(date, close)]。更新偏晚，作为官方口径兜底。"""
+    text = download(CBOE_VIX_URL).decode('utf-8-sig')
+    rows = []
+    for row in csv.DictReader(io.StringIO(text)):
+        d = row.get('DATE') or row.get('date')
+        c = row.get('CLOSE') or row.get('close')
+        if not d or not c:
+            continue
+        try:
+            rows.append((_norm_date(d), float(c)))
+        except (ValueError, TypeError):
+            continue
+    if not rows:
+        raise RuntimeError('CBOE 文件解析为空')
+    rows.sort()
+    print('  CBOE VIX_History: %d 行 (%s ~ %s)' % (len(rows), rows[0][0], rows[-1][0]))
+    return rows
+
+
+def fetch_yahoo_vix(rng='max'):
+    """Yahoo ^VIX 日线 → list[(date, close)]。美股收盘后几分钟即可拿到当日收盘，
+    是解决 CBOE 文件 T+1 更新延迟的主源。range='max' 返回 1990 年至今全量。"""
+    last_err = None
+    for host in YAHOO_VIX_HOSTS:
+        for _ in range(2):
+            try:
+                url = ('https://' + host + '/v8/finance/chart/%5EVIX?interval=1d&range=' + rng)
+                r = requests.get(url, headers=HEADERS, timeout=30)
+                r.raise_for_status()
+                result = (r.json().get('chart') or {}).get('result') or []
+                if not result:
+                    raise RuntimeError('Yahoo 响应缺少 chart.result')
+                ts = result[0].get('timestamp') or []
+                closes = ((result[0].get('indicators') or {}).get('quote') or [{}])[0].get('close') or []
+                rows = []
+                for t, c in zip(ts, closes):
+                    if c is None:
+                        continue
+                    rows.append((datetime.fromtimestamp(t, tz=timezone.utc).date().isoformat(),
+                                 float(c)))
+                if not rows:
+                    raise RuntimeError('Yahoo 解析后为空')
+                rows.sort()
+                print('  Yahoo ^VIX(%s): %d 行 (%s ~ %s)'
+                      % (host, len(rows), rows[0][0], rows[-1][0]))
+                return rows
+            except Exception as e:
+                last_err = e
+                time.sleep(2)
+    raise RuntimeError('Yahoo 全部失败: %s' % last_err)
+
+
+def fetch_stooq_vix():
+    """Stooq VIX 日线 → list[(date, close)]，第三级兜底。"""
+    text = download(STOOQ_VIX_URL).decode('utf-8-sig')
+    rows = []
+    for row in csv.DictReader(io.StringIO(text)):
+        d, c = row.get('Date'), row.get('Close')
+        if not d or not c:
+            continue
+        try:
+            rows.append((_norm_date(d), float(c)))
+        except (ValueError, TypeError):
+            continue
+    if not rows:
+        raise RuntimeError('Stooq 解析为空')
+    rows.sort()
+    print('  Stooq VIX: %d 行 (%s ~ %s)' % (len(rows), rows[0][0], rows[-1][0]))
+    return rows
+
+
+def build_vix_csv():
+    """多源合并构建 vix_history.csv（date,close）。
+    优先级：Yahoo 最新 → CBOE 官方覆盖重叠日期（口径最准）→ Stooq 仅补空缺。
+    任一源失败不影响其余，全部失败才抛异常。"""
+    merged = {}
+    errors = []
+
+    def _try(name, fn, overwrite):
+        try:
+            rows = fn()
+        except Exception as e:
+            errors.append('%s: %s' % (name, e))
+            print('  [WARN] %s 获取失败: %s' % (name, e))
+            return
+        for d, c in rows:
+            if overwrite:
+                merged[d] = c
+            else:
+                merged.setdefault(d, c)
+
+    _try('Yahoo', fetch_yahoo_vix, overwrite=True)     # 最快，先铺全量
+    _try('CBOE', fetch_cboe_vix, overwrite=True)       # 官方口径覆盖重叠日
+    _try('Stooq', fetch_stooq_vix, overwrite=False)    # 只补前两源缺失的日期
+
+    if not merged:
+        raise RuntimeError('全部 VIX 数据源失败 → %s' % '; '.join(errors))
+
+    dates = sorted(merged.keys())
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(['date', 'close'])
+    for d in dates:
+        w.writerow([d, '%.2f' % merged[d]])
+    content = buf.getvalue().encode('utf-8')
+    print('  VIX 合并完成: %d 行 (%s ~ %s)' % (len(dates), dates[0], dates[-1]))
+    return content
+
+
 # ============ Gitee 推送 ============
 def gitee_get_sha(path):
     """读取 Gitee 上已有文件的 sha 和内容；文件不存在返回 (None, None)"""
@@ -189,13 +318,13 @@ def main():
         ok = False
         print('[FAILED] fear-greed.csv: %s' % e)
 
-    # 2. vix_history.csv —— CBOE 直连
+    # 2. vix_history.csv —— Yahoo(主) + CBOE(官方兜底) + Stooq 合并
     try:
-        content = download(CBOE_VIX_URL)
+        content = build_vix_csv()
         with open('vix_history.csv', 'wb') as f:
             f.write(content)
         status = gitee_push('vix_history.csv', content)
-        print('[%s] vix_history.csv ← CBOE (%d bytes)' % (status, len(content)))
+        print('[%s] vix_history.csv ← VIX 多源合并 (%d bytes)' % (status, len(content)))
     except Exception as e:
         ok = False
         print('[FAILED] vix_history.csv: %s' % e)
