@@ -47,6 +47,11 @@ CNN_HEADERS = {
 ARCHIVE_PATH = 'datasets/archive/fear-greed-pre-2021.csv'
 ARCHIVE_CUTOFF = '2021-02-01'
 
+# 美股收盘缓冲：常规收盘 16:00 ET = 20:00 UTC（夏令时）/ 21:00 UTC（冬令时）。
+# 取 22:00 UTC 作统一缓冲，早于此时间抓取时，当天（UTC 日期）的数据点一律不入库，
+# 避免把盘中半成品写进文件（对齐上游 whit3rabbit 只发布已收盘交易日的效果）。
+US_CLOSE_BUFFER_UTC = (22, 0)
+
 # CBOE VIX 全量历史（官方口径，但文件更新时点偏晚，且部分区域被 Cloudflare 拦）
 CBOE_VIX_URL = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv'
 # Yahoo ^VIX 日线（美股收盘后几分钟即可拿到当日收盘，适合补 CBOE 的更新延迟）
@@ -58,12 +63,14 @@ STOOQ_VIX_URL = 'https://stooq.com/q/d/l/?s=%5Evix&i=d'
 # ============ CNN 恐惧贪婪指数 ============
 def fetch_cnn_fear_greed():
     """从 CNN API 抓取恐惧贪婪指数（2021-02-01 至今）。
-    返回 list[tuple(date_str, score, rating)]，按日期升序。
+    返回 list[tuple(date_str, score, rating)]，按日期升序（同一日期可能有多条，
+    后者为当日更新的快照，写入时覆盖前者 = 上游 build_combined.py 的 keep='last'）。
 
-    注意：CNN 的 fear_and_greed_historical 里除了每天 00:00 UTC 的日线点，
-    还会追加"当前实时点"（时间戳为抓取时刻或 23:59，数值随盘中行情变动，
-    收盘后次日才被官方用完整数据重算覆盖）。入库只保留日线点，
-    否则会在文件末尾写入盘中半成品，导致与上游仓库的数值对不上。"""
+    与上游 whit3rabbit 一致的取数语义：
+      1. 每个日期取其最后一个点（美股收盘后运行时，实时点即当日收盘值）；
+      2. 只发布已收盘的交易日——抓取时刻早于 US_CLOSE_BUFFER_UTC 时，
+         当天（UTC 日期）的点一律丢弃，避免写入盘中半成品；
+      3. 晚于当前 UTC 日期的未来点一律丢弃。"""
     resp = requests.get(CNN_FG_URL, headers=CNN_HEADERS, timeout=30)
     resp.raise_for_status()
     payload = resp.json()
@@ -72,22 +79,27 @@ def fetch_cnn_fear_greed():
     if not data:
         raise RuntimeError('CNN 响应缺少 fear_and_greed_historical.data')
 
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    market_closed = (now.hour, now.minute) >= US_CLOSE_BUFFER_UTC
+
     rows = []
     dropped = 0
     for entry in data:
         ts_ms = entry['x']
         t = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-        if (t.hour, t.minute, t.second) != (0, 0, 0):
-            dropped += 1          # 实时点，丢弃
+        d = t.date().isoformat()
+        if d > today or (d == today and not market_closed):
+            dropped += 1          # 未来点 / 当天尚未收盘
             continue
-        score = float(entry['y'])
-        rating = entry.get('rating', '')
-        rows.append((t.date().isoformat(), score, rating))
+        rows.append((d, float(entry['y']), entry.get('rating', '')))
     if not rows:
-        raise RuntimeError('CNN 日线点为空（全部为实时点？）')
+        raise RuntimeError('CNN 无可用数据点（当天尚未收盘？）')
+    # 稳定排序：仅按日期分组，同日保持 CNN 原始顺序（日线点在前、实时点在后）
     rows.sort(key=lambda r: r[0])
-    print('  CNN 直抓: %d 行 (%s ~ %s)，丢弃实时点 %d 个'
-          % (len(rows), rows[0][0], rows[-1][0], dropped))
+    merged = len(rows) - len(set(r[0] for r in rows))
+    print('  CNN 直抓: %d 个日期 (%s ~ %s)，丢弃未收盘/未来点 %d 个，同日期多快照合并 %d 个'
+          % (len(set(r[0] for r in rows)), rows[0][0], rows[-1][0], dropped, merged))
     return rows
 
 
@@ -127,7 +139,8 @@ def build_fear_greed_csv():
     archive_rows = load_pre2021_archive()
     cnn_rows = fetch_cnn_fear_greed()
 
-    # 合并：CNN 数据覆盖归档中的重叠日期
+    # 合并：CNN 数据覆盖归档中的重叠日期；同日期多条 CNN 快照时后者覆盖前者
+    # （对应上游 build_combined.py 的 drop_duplicates(keep='last')）
     combined = {}
     for d, score, rating in archive_rows:
         combined[d] = (score, rating)
