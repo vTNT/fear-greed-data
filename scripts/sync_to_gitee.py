@@ -18,7 +18,9 @@
 import base64
 import csv
 import io
+import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -58,6 +60,20 @@ CBOE_VIX_URL = 'https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_Hist
 YAHOO_VIX_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
 # Stooq VIX 日线 CSV（第三级兜底）
 STOOQ_VIX_URL = 'https://stooq.com/q/d/l/?s=%5Evix&i=d'
+
+# 黄金：Yahoo COMEX 黄金主连（境外 Actions 可达）+ 新浪 GC（境内兜底）
+YAHOO_GOLD_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
+SINA_GOLD_URL = ('https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/'
+                 'GlobalFuturesService.getGlobalFuturesDailyKLine?symbol=GC')
+# FRED CSV（Actions 境外节点可达）：DGS2=2年期美债, DFF=联邦基金有效利率
+FRED_CSV_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=%s'
+# 美国财政部每日国债收益率曲线（FRED 失败时兜底）
+TREASURY_CSV_URL = ('https://home.treasury.gov/resource-center/data-chart-center/interest-rates/'
+                    'daily-treasury-rates.csv/%d/all?type=daily_treasury_yield_curve'
+                    '&field_tdr_date_value=%d&page&_format=csv')
+# 纽约联储 EFFR（FRED 失败时兜底）
+NYFED_EFFR_URL = ('https://markets.newyorkfed.org/api/rates/unsecured/effr/search.json'
+                  '?startDate=%s&endDate=%s')
 
 
 # ============ CNN 恐惧贪婪指数 ============
@@ -293,6 +309,181 @@ def build_vix_csv():
     return content
 
 
+# ============ 黄金 / 2Y 美债 / 联邦基金利率（黄金趋势策略数据链） ============
+def _rows_to_csv(rows, header, fmt):
+    """rows=[(date, value)] → CSV bytes（按日期升序）。"""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    for d, v in sorted(rows):
+        w.writerow([d, fmt % v])
+    return buf.getvalue().encode('utf-8')
+
+
+def fetch_yahoo_gold(rng='max'):
+    """Yahoo COMEX 黄金主连 GC=F 日线 → list[(date, close)]。"""
+    last_err = None
+    for host in YAHOO_GOLD_HOSTS:
+        for _ in range(2):
+            try:
+                url = ('https://' + host + '/v8/finance/chart/GC%3DF?interval=1d&range=' + rng)
+                r = requests.get(url, headers=HEADERS, timeout=30)
+                r.raise_for_status()
+                result = (r.json().get('chart') or {}).get('result') or []
+                if not result:
+                    raise RuntimeError('Yahoo 响应缺少 chart.result')
+                ts = result[0].get('timestamp') or []
+                closes = ((result[0].get('indicators') or {}).get('quote') or [{}])[0].get('close') or []
+                rows = []
+                for t, c in zip(ts, closes):
+                    if c is None:
+                        continue
+                    rows.append((datetime.fromtimestamp(t, tz=timezone.utc).date().isoformat(),
+                                 float(c)))
+                if not rows:
+                    raise RuntimeError('Yahoo 黄金解析后为空')
+                rows.sort()
+                print('  Yahoo GC=F(%s): %d 行 (%s ~ %s)'
+                      % (host, len(rows), rows[0][0], rows[-1][0]))
+                return rows
+            except Exception as e:
+                last_err = e
+                time.sleep(2)
+    raise RuntimeError('Yahoo 黄金全部失败: %s' % last_err)
+
+
+def fetch_sina_gold():
+    """新浪 COMEX 黄金主连日K → list[(date, close)]（境内可达）。"""
+    r = requests.get(SINA_GOLD_URL, headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    m = re.search(r'\[.*\]', r.text, re.S)
+    if not m:
+        raise RuntimeError('新浪黄金返回中未找到 JSON 数组')
+    data = json.loads(m.group(0))
+    rows = []
+    for item in data:
+        close = item.get('close')
+        if close in (None, '', '0'):
+            continue
+        try:
+            rows.append((_norm_date(item['date']), float(close)))
+        except (ValueError, TypeError, KeyError):
+            continue
+    if not rows:
+        raise RuntimeError('新浪黄金解析为空')
+    rows.sort()
+    print('  Sina GC: %d 行 (%s ~ %s)' % (len(rows), rows[0][0], rows[-1][0]))
+    return rows
+
+
+def build_gold_csv():
+    """Yahoo 全量历史打底，新浪最近数据覆盖重叠日期（更贴近境内看盘口径）。"""
+    merged = {}
+    errors = []
+    try:
+        for d, v in fetch_yahoo_gold():
+            merged[d] = v
+    except Exception as e:
+        errors.append('Yahoo: %s' % e)
+        print('  [WARN] Yahoo 黄金获取失败: %s' % e)
+    try:
+        for d, v in fetch_sina_gold():
+            merged[d] = v
+    except Exception as e:
+        errors.append('Sina: %s' % e)
+        print('  [WARN] 新浪黄金获取失败: %s' % e)
+    if not merged:
+        raise RuntimeError('全部黄金数据源失败 → %s' % '; '.join(errors))
+    content = _rows_to_csv([(d, v) for d, v in merged.items()], ['date', 'close'], '%.2f')
+    print('  黄金合并完成: %d 行 (%s ~ %s)'
+          % (len(merged), min(merged), max(merged)))
+    return content
+
+
+def fetch_fred_series(series_id):
+    """FRED 单序列 CSV → list[(date, value)]；缺失值 '.' 自动跳过。"""
+    text = download(FRED_CSV_URL % series_id).decode('utf-8-sig')
+    rows = []
+    for row in csv.DictReader(io.StringIO(text)):
+        d = row.get('observation_date') or row.get('DATE') or row.get('date')
+        v = row.get(series_id)
+        if not d or v in (None, '', '.'):
+            continue
+        try:
+            rows.append((_norm_date(d), float(v)))
+        except (ValueError, TypeError):
+            continue
+    if not rows:
+        raise RuntimeError('FRED %s 解析为空' % series_id)
+    rows.sort()
+    print('  FRED %s: %d 行 (%s ~ %s)' % (series_id, len(rows), rows[0][0], rows[-1][0]))
+    return rows
+
+
+def fetch_treasury_us2y():
+    """美国财政部 2 年期收益率 → list[(date, value)]（FRED 兜底）。"""
+    end_year = datetime.now(timezone.utc).year
+    rows = []
+    for y in range(2015, end_year + 1):
+        try:
+            text = download(TREASURY_CSV_URL % (y, y)).decode('utf-8-sig')
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                d = row.get('Date') or row.get('DATE')
+                v = row.get('2 Yr') or row.get('2 YR')
+                if not d or not v:
+                    continue
+                try:
+                    rows.append((_norm_date(d), float(v)))
+                except (ValueError, TypeError):
+                    continue
+        except Exception as e:
+            print('  [WARN] 财政部 %d 年抓取失败: %s' % (y, e))
+    if not rows:
+        raise RuntimeError('财政部 2Y 解析为空')
+    rows.sort()
+    print('  Treasury 2Y: %d 行 (%s ~ %s)' % (len(rows), rows[0][0], rows[-1][0]))
+    return rows
+
+
+def fetch_nyfed_effr():
+    """纽约联储 EFFR（2015 至今）→ list[(date, value)]。"""
+    end = datetime.now(timezone.utc).date().isoformat()
+    text = download(NYFED_EFFR_URL % ('2015-01-01', end)).decode('utf-8')
+    payload = json.loads(text)
+    rows = []
+    for item in payload.get('refRates') or []:
+        try:
+            rows.append((_norm_date(item['effectiveDate']), float(item['percentRate'])))
+        except (ValueError, TypeError, KeyError):
+            continue
+    if not rows:
+        raise RuntimeError('纽约联储 EFFR 解析为空')
+    rows.sort()
+    print('  NY Fed EFFR: %d 行 (%s ~ %s)' % (len(rows), rows[0][0], rows[-1][0]))
+    return rows
+
+
+def build_us2y_csv():
+    """FRED DGS2 为主，美国财政部兜底。"""
+    try:
+        rows = fetch_fred_series('DGS2')
+    except Exception as e:
+        print('  [WARN] FRED DGS2 失败: %s，回退财政部' % e)
+        rows = fetch_treasury_us2y()
+    return _rows_to_csv(rows, ['date', 'us2y'], '%.3f')
+
+
+def build_fedfunds_csv():
+    """FRED DFF 为主，纽约联储 EFFR 兜底。"""
+    try:
+        rows = fetch_fred_series('DFF')
+    except Exception as e:
+        print('  [WARN] FRED DFF 失败: %s，回退纽约联储' % e)
+        rows = fetch_nyfed_effr()
+    return _rows_to_csv(rows, ['date', 'effr'], '%.3f')
+
+
 # ============ Gitee 推送 ============
 def gitee_get_sha(path):
     """读取 Gitee 上已有文件的 sha 和内容；文件不存在返回 (None, None)"""
@@ -353,6 +544,39 @@ def main():
     except Exception as e:
         ok = False
         print('[FAILED] vix_history.csv: %s' % e)
+
+    # 3. gold_history.csv —— Yahoo GC=F 全量 + 新浪 GC 覆盖最近数据
+    try:
+        content = build_gold_csv()
+        with open('gold_history.csv', 'wb') as f:
+            f.write(content)
+        status = gitee_push('gold_history.csv', content)
+        print('[%s] gold_history.csv ← Yahoo GC=F + Sina GC (%d bytes)' % (status, len(content)))
+    except Exception as e:
+        ok = False
+        print('[FAILED] gold_history.csv: %s' % e)
+
+    # 4. us2y_history.csv —— FRED DGS2，财政部兜底
+    try:
+        content = build_us2y_csv()
+        with open('us2y_history.csv', 'wb') as f:
+            f.write(content)
+        status = gitee_push('us2y_history.csv', content)
+        print('[%s] us2y_history.csv ← FRED DGS2 (%d bytes)' % (status, len(content)))
+    except Exception as e:
+        ok = False
+        print('[FAILED] us2y_history.csv: %s' % e)
+
+    # 5. fedfunds_history.csv —— FRED DFF，纽约联储 EFFR 兜底
+    try:
+        content = build_fedfunds_csv()
+        with open('fedfunds_history.csv', 'wb') as f:
+            f.write(content)
+        status = gitee_push('fedfunds_history.csv', content)
+        print('[%s] fedfunds_history.csv ← FRED DFF (%d bytes)' % (status, len(content)))
+    except Exception as e:
+        ok = False
+        print('[FAILED] fedfunds_history.csv: %s' % e)
 
     sys.exit(0 if ok else 1)
 
