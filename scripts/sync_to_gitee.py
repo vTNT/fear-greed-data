@@ -23,7 +23,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -36,8 +36,12 @@ GITEE_API = 'https://gitee.com/api/v5/repos/%s/contents/{path}' % GITEE_REPO
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
                          'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'}
 
-# CNN 恐惧贪婪指数 API（返回 2021-02-01 至今全量历史，一次 GET）
-CNN_FG_URL = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata/2021-02-01'
+# 增量同步：以仓库内已有 CSV 为基线，只抓最近窗口；SYNC_FULL=1 强制全量重建
+FULL_SYNC = os.environ.get('SYNC_FULL', '0') == '1'
+INCR_WINDOW_DAYS = 60
+
+# CNN 恐惧贪婪指数 API（路径中的日期为起始日，支持只抓最近窗口）
+CNN_FG_URL = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata/%s'
 CNN_HEADERS = {
     'User-Agent': os.environ.get('CNN_FETCH_USER_AGENT') or HEADERS['User-Agent'],
     'Accept': 'application/json, text/plain, */*',
@@ -65,8 +69,8 @@ STOOQ_VIX_URL = 'https://stooq.com/q/d/l/?s=%5Evix&i=d'
 YAHOO_GOLD_HOSTS = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']
 SINA_GOLD_URL = ('https://stock2.finance.sina.com.cn/futures/api/jsonp.php/var%20t=/'
                  'GlobalFuturesService.getGlobalFuturesDailyKLine?symbol=GC')
-# FRED CSV（Actions 境外节点可达）：DGS2=2年期美债, DFF=联邦基金有效利率
-FRED_CSV_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=%s'
+# FRED CSV（Actions 境外节点可达，cosd 指定起始日以支持增量）：DGS2=2年期美债, DFF=联邦基金有效利率
+FRED_CSV_URL = 'https://fred.stlouisfed.org/graph/fredgraph.csv?id=%s&cosd=%s'
 # 美国财政部每日国债收益率曲线（FRED 失败时兜底）
 TREASURY_CSV_URL = ('https://home.treasury.gov/resource-center/data-chart-center/interest-rates/'
                     'daily-treasury-rates.csv/%d/all?type=daily_treasury_yield_curve'
@@ -77,7 +81,7 @@ NYFED_EFFR_URL = ('https://markets.newyorkfed.org/api/rates/unsecured/effr/searc
 
 
 # ============ CNN 恐惧贪婪指数 ============
-def fetch_cnn_fear_greed():
+def fetch_cnn_fear_greed(since='2021-02-01'):
     """从 CNN API 抓取恐惧贪婪指数（2021-02-01 至今）。
     返回 list[tuple(date_str, score, rating)]，按日期升序（同一日期可能有多条，
     后者为当日更新的快照，写入时覆盖前者 = 上游 build_combined.py 的 keep='last'）。
@@ -87,7 +91,7 @@ def fetch_cnn_fear_greed():
       2. 只发布已收盘的交易日——抓取时刻早于 US_CLOSE_BUFFER_UTC 时，
          当天（UTC 日期）的点一律丢弃，避免写入盘中半成品；
       3. 晚于当前 UTC 日期的未来点一律丢弃。"""
-    resp = requests.get(CNN_FG_URL, headers=CNN_HEADERS, timeout=30)
+    resp = requests.get(CNN_FG_URL % since, headers=CNN_HEADERS, timeout=30)
     resp.raise_for_status()
     payload = resp.json()
     hist = payload.get('fear_and_greed_historical') or {}
@@ -150,18 +154,22 @@ def load_pre2021_archive():
 
 
 def build_fear_greed_csv():
-    """构建完整 fear-greed.csv：pre-2021 归档 + CNN 直抓 2021+ 数据。
+    """构建完整 fear-greed.csv。
+    增量模式：仓库内已有文件为基线 + CNN 只抓最近窗口；
+    无基线（或 SYNC_FULL=1）时回退全量：pre-2021 归档 + CNN 2021 至今。
     返回 bytes (CSV 内容)。"""
-    archive_rows = load_pre2021_archive()
-    cnn_rows = fetch_cnn_fear_greed()
-
-    # 合并：CNN 数据覆盖归档中的重叠日期；同日期多条 CNN 快照时后者覆盖前者
-    # （对应上游 build_combined.py 的 drop_duplicates(keep='last')）
-    combined = {}
-    for d, score, rating in archive_rows:
-        combined[d] = (score, rating)
-    for d, score, rating in cnn_rows:
-        combined[d] = (score, rating)
+    base = {} if FULL_SYNC else _load_local_fear_greed('fear-greed.csv')
+    combined = dict(base)
+    if base:
+        # 增量：CNN 只抓最近窗口，覆盖基线中重叠日期
+        for d, score, rating in fetch_cnn_fear_greed(_since()):
+            combined[d] = (score, rating)
+    else:
+        # 全量：本地归档打底 + CNN 全量
+        for d, score, rating in load_pre2021_archive():
+            combined[d] = (score, rating)
+        for d, score, rating in fetch_cnn_fear_greed():
+            combined[d] = (score, rating)
 
     sorted_dates = sorted(combined.keys())
     buf = io.StringIO()
@@ -177,12 +185,12 @@ def build_fear_greed_csv():
 
 
 # ============ 通用下载 ============
-def download(url):
+def download(url, min_size=1000):
     """下载上游文件，返回 bytes；失败抛异常"""
     r = requests.get(url, headers=HEADERS, timeout=60)
     r.raise_for_status()
     content = r.content
-    if len(content) < 1000:
+    if len(content) < min_size:
         raise ValueError('内容过短（%d bytes），疑似上游异常: %s' % (len(content), url))
     return content
 
@@ -197,6 +205,51 @@ def _norm_date(s):
         except ValueError:
             continue
     raise ValueError('无法识别的日期: %s' % s)
+
+
+# ============ 增量基线（读取仓库内已有 CSV） ============
+def _since(days=INCR_WINDOW_DAYS):
+    """增量抓取窗口的起始日（UTC）。"""
+    return (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+
+
+def _load_local_rows(path):
+    """读取仓库内已有 CSV（date,value）→ dict{date: float}；文件不存在返回 {}。"""
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.reader(f)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 2:
+                continue
+            try:
+                out[_norm_date(row[0])] = float(row[1])
+            except (ValueError, TypeError):
+                continue
+    if out:
+        print('  本地基线 %s: %d 行 (%s ~ %s)' % (path, len(out), min(out), max(out)))
+    return out
+
+
+def _load_local_fear_greed(path):
+    """读取仓库内已有 fear-greed.csv → dict{date: (score, rating)}；不存在返回 {}。"""
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+        for row in csv.DictReader(f):
+            d = (row.get('Date') or '').strip()
+            if not d:
+                continue
+            try:
+                out[_norm_date(d)] = (float(row['Fear Greed']), row.get('Rating', ''))
+            except (ValueError, TypeError, KeyError):
+                continue
+    if out:
+        print('  本地基线 %s: %d 行 (%s ~ %s)' % (path, len(out), min(out), max(out)))
+    return out
 
 
 def fetch_cboe_vix():
@@ -273,9 +326,12 @@ def fetch_stooq_vix():
 
 def build_vix_csv():
     """多源合并构建 vix_history.csv（date,close）。
-    优先级：Yahoo 最新 → CBOE 官方覆盖重叠日期（口径最准）→ Stooq 仅补空缺。
+    增量模式：仓库内已有文件为基线，Yahoo 只抓最近 3 个月；CBOE 全量仅在
+    Yahoo 失败、无基线或每周一时执行（校准官方口径）；Stooq 仅在全空时兜底。
+    优先级：Yahoo 最新 → CBOE 官方覆盖重叠日期 → Stooq 仅补空缺。
     任一源失败不影响其余，全部失败才抛异常。"""
-    merged = {}
+    base = {} if FULL_SYNC else _load_local_rows('vix_history.csv')
+    merged = dict(base)
     errors = []
 
     def _try(name, fn, overwrite):
@@ -284,16 +340,24 @@ def build_vix_csv():
         except Exception as e:
             errors.append('%s: %s' % (name, e))
             print('  [WARN] %s 获取失败: %s' % (name, e))
-            return
+            return False
         for d, c in rows:
             if overwrite:
                 merged[d] = c
             else:
                 merged.setdefault(d, c)
+        return True
 
-    _try('Yahoo', fetch_yahoo_vix, overwrite=True)     # 最快，先铺全量
-    _try('CBOE', fetch_cboe_vix, overwrite=True)       # 官方口径覆盖重叠日
-    _try('Stooq', fetch_stooq_vix, overwrite=False)    # 只补前两源缺失的日期
+    yahoo_ok = _try('Yahoo', lambda: fetch_yahoo_vix('max' if not base else '3mo'),
+                    overwrite=True)
+    # CBOE 是整文件全量，只在需要时拉取：无基线 / Yahoo 失败 / 每周一校准
+    weekly = datetime.now(timezone.utc).weekday() == 0
+    if FULL_SYNC or not base or not yahoo_ok or weekly:
+        _try('CBOE', fetch_cboe_vix, overwrite=True)   # 官方口径覆盖重叠日
+    else:
+        print('  CBOE 全量跳过（Yahoo 已成功；每周一自动全量校准）')
+    if not merged:
+        _try('Stooq', fetch_stooq_vix, overwrite=False)  # 只补前两源缺失的日期
 
     if not merged:
         raise RuntimeError('全部 VIX 数据源失败 → %s' % '; '.join(errors))
@@ -377,32 +441,41 @@ def fetch_sina_gold():
 
 
 def build_gold_csv():
-    """Yahoo 全量历史打底，新浪最近数据覆盖重叠日期（更贴近境内看盘口径）。"""
-    merged = {}
+    """Yahoo 全量历史打底，新浪最近数据覆盖重叠日期（更贴近境内看盘口径）。
+    增量模式：仓库内已有文件为基线，新浪（境内稳定）为主，Yahoo 仅在无基线
+    或新浪失败时兜底，避免 Actions 被 Yahoo 429 限流刷 WARN。"""
+    base = {} if FULL_SYNC else _load_local_rows('gold_history.csv')
+    merged = dict(base)
     errors = []
-    try:
-        for d, v in fetch_yahoo_gold():
-            merged[d] = v
-    except Exception as e:
-        errors.append('Yahoo: %s' % e)
-        print('  [WARN] Yahoo 黄金获取失败: %s' % e)
+    sina_ok = False
     try:
         for d, v in fetch_sina_gold():
             merged[d] = v
+        sina_ok = True
     except Exception as e:
         errors.append('Sina: %s' % e)
         print('  [WARN] 新浪黄金获取失败: %s' % e)
+    if not sina_ok or not base:
+        try:
+            rng = 'max' if not base else '3mo'
+            for d, v in fetch_yahoo_gold(rng):
+                merged.setdefault(d, v)   # 新浪口径优先，Yahoo 只补缺口
+        except Exception as e:
+            errors.append('Yahoo: %s' % e)
+            print('  [WARN] Yahoo 黄金获取失败: %s' % e)
     if not merged:
         raise RuntimeError('全部黄金数据源失败 → %s' % '; '.join(errors))
-    content = _rows_to_csv([(d, v) for d, v in merged.items()], ['date', 'close'], '%.2f')
+    content = _rows_to_csv(merged.items(), ['date', 'close'], '%.2f')
     print('  黄金合并完成: %d 行 (%s ~ %s)'
           % (len(merged), min(merged), max(merged)))
     return content
 
 
-def fetch_fred_series(series_id):
-    """FRED 单序列 CSV → list[(date, value)]；缺失值 '.' 自动跳过。"""
-    text = download(FRED_CSV_URL % series_id).decode('utf-8-sig')
+def fetch_fred_series(series_id, start=None):
+    """FRED 单序列 CSV → list[(date, value)]；缺失值 '.' 自动跳过。
+    start 指定起始日（增量），None 时从 2015-01-01 全量拉取。"""
+    text = download(FRED_CSV_URL % (series_id, start or '2015-01-01'),
+                    min_size=200).decode('utf-8-sig')
     rows = []
     for row in csv.DictReader(io.StringIO(text)):
         d = row.get('observation_date') or row.get('DATE') or row.get('date')
@@ -420,11 +493,12 @@ def fetch_fred_series(series_id):
     return rows
 
 
-def fetch_treasury_us2y():
-    """美国财政部 2 年期收益率 → list[(date, value)]（FRED 兜底）。"""
+def fetch_treasury_us2y(start_year=None):
+    """美国财政部 2 年期收益率 → list[(date, value)]（FRED 兜底）。
+    start_year 指定起始年份（增量取当年），None 时从 2015 起全量。"""
     end_year = datetime.now(timezone.utc).year
     rows = []
-    for y in range(2015, end_year + 1):
+    for y in range(start_year or 2015, end_year + 1):
         try:
             text = download(TREASURY_CSV_URL % (y, y)).decode('utf-8-sig')
             reader = csv.DictReader(io.StringIO(text))
@@ -446,10 +520,10 @@ def fetch_treasury_us2y():
     return rows
 
 
-def fetch_nyfed_effr():
-    """纽约联储 EFFR（2015 至今）→ list[(date, value)]。"""
+def fetch_nyfed_effr(start='2015-01-01'):
+    """纽约联储 EFFR → list[(date, value)]。start 指定起始日（增量）。"""
     end = datetime.now(timezone.utc).date().isoformat()
-    text = download(NYFED_EFFR_URL % ('2015-01-01', end)).decode('utf-8')
+    text = download(NYFED_EFFR_URL % (start, end)).decode('utf-8')
     payload = json.loads(text)
     rows = []
     for item in payload.get('refRates') or []:
@@ -465,23 +539,31 @@ def fetch_nyfed_effr():
 
 
 def build_us2y_csv():
-    """FRED DGS2 为主，美国财政部兜底。"""
+    """FRED DGS2 为主，美国财政部兜底。增量模式只抓最近窗口并合并本地基线。"""
+    base = {} if FULL_SYNC else _load_local_rows('us2y_history.csv')
+    start = None if not base else _since()
     try:
-        rows = fetch_fred_series('DGS2')
+        rows = fetch_fred_series('DGS2', start)
     except Exception as e:
         print('  [WARN] FRED DGS2 失败: %s，回退财政部' % e)
-        rows = fetch_treasury_us2y()
-    return _rows_to_csv(rows, ['date', 'us2y'], '%.3f')
+        rows = fetch_treasury_us2y(None if not base else int(start[:4]))
+    merged = dict(base)
+    merged.update(dict(rows))
+    return _rows_to_csv(merged.items(), ['date', 'us2y'], '%.3f')
 
 
 def build_fedfunds_csv():
-    """FRED DFF 为主，纽约联储 EFFR 兜底。"""
+    """FRED DFF 为主，纽约联储 EFFR 兜底。增量模式只抓最近窗口并合并本地基线。"""
+    base = {} if FULL_SYNC else _load_local_rows('fedfunds_history.csv')
+    start = None if not base else _since()
     try:
-        rows = fetch_fred_series('DFF')
+        rows = fetch_fred_series('DFF', start)
     except Exception as e:
         print('  [WARN] FRED DFF 失败: %s，回退纽约联储' % e)
-        rows = fetch_nyfed_effr()
-    return _rows_to_csv(rows, ['date', 'effr'], '%.3f')
+        rows = fetch_nyfed_effr(start or '2015-01-01')
+    merged = dict(base)
+    merged.update(dict(rows))
+    return _rows_to_csv(merged.items(), ['date', 'effr'], '%.3f')
 
 
 # ============ Gitee 推送 ============
@@ -493,6 +575,9 @@ def gitee_get_sha(path):
         return None, None
     r.raise_for_status()
     data = r.json()
+    # Gitee 对不存在的文件路径返回 200 + 空数组（而非 404），此时按“文件不存在”处理
+    if not isinstance(data, dict):
+        return None, None
     remote_b64 = (data.get('content') or '').replace('\n', '')
     return data.get('sha'), remote_b64
 
