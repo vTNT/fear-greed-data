@@ -7,6 +7,11 @@ on:
     # 聚宽日报（北京 08:00）前再同步一次，双保险覆盖 Actions 排队延迟
     - cron: '30 23 * * 1-5'   # UTC 23:30 = 北京时间 07:30
   workflow_dispatch:
+    inputs:
+      full:
+        description: '全量重建（1=忽略本地基线，默认 0）'
+        required: false
+        default: '0'
 
 permissions:
   contents: write
@@ -27,6 +32,7 @@ jobs:
       - name: Sync CSV to Gitee
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          SYNC_FULL: ${{ github.event.inputs.full || '0' }}
         run: python scripts/sync_to_gitee.py
 
       # 同时把文件提交回 fork，避免 GitHub 因 60 天无活动暂停定时任务
